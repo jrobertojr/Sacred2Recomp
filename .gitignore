@@ -13,3 +13,6 @@
 *.log
 .env
 *.sav
+
+/launcher/bin/
+/launcher/obj/

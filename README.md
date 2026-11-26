@@ -20,3 +20,6 @@ Projeto experimental e não oficial de recompilação nativa de Sacred 2: Fallen
 
 ## Credits and rights
 Thanks to the [ReXGlue](https://github.com/rexglue/rexglue-sdk), Xenia and XenonRecomp contributors. Sacred 2 and its original content belong to their respective rights holders. This project is not affiliated with or endorsed by them. Third-party components retain their respective licenses. No license is granted to original game content.
+
+## Experimental graphical launcher
+See [launcher documentation](launcher/README.md). Build with dotnet build launcher/Sacred2Launcher.csproj -c Release. End-to-end installation remains unvalidated.
