@@ -1,0 +1,159 @@
+diff --git a/src/app/title_app.cpp b/src/app/title_app.cpp
+index 185db32..986bfcb 100644
+--- a/src/app/title_app.cpp
++++ b/src/app/title_app.cpp
+@@ -5,6 +5,7 @@
+ #include <rex/app/title_app.h>
+ 
+ #include <filesystem>
++#include <cstdlib>
+ #include <format>
+ #include <string>
+ 
+@@ -49,6 +50,15 @@ void ShutdownCOM() {}
+ namespace rex::app {
+ 
+ namespace {
++bool S2Headless() {
++#if REX_PLATFORM_WIN32
++  wchar_t value[4]{};
++  return GetEnvironmentVariableW(L"S2_HEADLESS_TEST", value, 4) == 1 && value[0] == L'1';
++#else
++  const char* v = std::getenv("S2_HEADLESS_TEST");
++  return v && std::string_view(v) == "1";
++#endif
++}
+ 
+ std::string ExitMessage(rex::kernel::TitleExitReason reason) {
+   switch (reason) {
+@@ -94,9 +104,9 @@ rex::kernel::TitleRuntime& TitleApp::GetTitleRuntime() {
+ AppSysRequirements TitleApp::GetRequirements() const {
+   AppSysRequirements needs;
+   needs.graphics_family = GraphicsFamily::kXenos;
+-  needs.audio = true;
+-  needs.input = true;
+-  needs.ui = true;
++  needs.audio = !S2Headless();
++  needs.input = !S2Headless();
++  needs.ui = !S2Headless();
+   return needs;
+ }
+ 
+@@ -196,14 +206,14 @@ void TitleApp::ReportError(std::string_view message) {
+     ui->ShowMessage(MessageType::kError, GetName(), message);
+     return;
+   }
+-  if (!IsHeadlessRequested()) {
++  if (!S2Headless() && !IsHeadlessRequested()) {
+     detail::ShowStartupBox(MessageType::kError, std::format("{}\n\n{}", GetName(), message));
+   }
+ }
+ 
+ platform::CrashReporterOptions TitleApp::GetCrashOptions() {
+   const rex::ui::IUISystem* ui = FindUI();
+-  return {.show_dialog = (ui && ui->HasWindow()) || !IsHeadlessRequested()};
++  return {.show_dialog = !S2Headless() && ((ui && ui->HasWindow()) || !IsHeadlessRequested())};
+ }
+ 
+ void TitleApp::OnStop() {
+diff --git a/src/xam/xam_content.cpp b/src/xam/xam_content.cpp
+index 5f7d19b..9a6fbf7 100644
+--- a/src/xam/xam_content.cpp
++++ b/src/xam/xam_content.cpp
+@@ -16,6 +16,11 @@
+ #include <rex/kernel/types/content.h>
+ #include <rex/memory/mapped_ptr.h>
+ #include <rex/kernel/title_runtime.h>
++#include <rex/kernel/object/file_object.h>
++#include <rex/kernel/object/object_table.h>
++#include <rex/filesystem/file.h>
++#include <rex/filesystem/file_system.h>
++#include <rex/string/text.h>
+ #include "xam/xam_ui.h"
+ #include <rex/logging/log_category.h>
+ #include "xam/categories.h"
+@@ -301,8 +306,29 @@ u32 XamContentOpenFile_entry([[maybe_unused]] u32 user_index,
+   return kernel::X_ERROR_FILE_NOT_FOUND;
+ }
+ 
+-u32 XamContentFlush_entry([[maybe_unused]] MappedString root_name, MappedVoid overlapped_ptr) {
++u32 XamContentFlush_entry(MappedString root_name, MappedVoid overlapped_ptr) {
+   kernel::X_RESULT result = kernel::X_ERROR_SUCCESS;
++  auto& title = CurrentTitle();
++  const auto root = title.file_system.FindLink(std::string(root_name.GetValue()) + ':');
++  if (!root || root->empty()) {
++    result = kernel::X_ERROR_FILE_NOT_FOUND;
++  } else {
++    for (const auto& file : title.objects.All<kernel::FileObject>()) {
++      const auto path = file->GetAbsolutePath();
++      if (!rex::string::utf8_starts_with_case(path, *root)) continue;
++      const auto rest = std::string_view(path).substr(root->size());
++      const auto sep = [](char ch) { return ch == '\\' || ch == '/'; };
++      if (!rest.empty() && !sep(rest.front()) && !sep(root->back())) continue;
++      std::lock_guard lock(file->file_lock);
++      const auto access = file->file->GetAccess();
++      if (!rex::HasFlags(access, filesystem::Access::kWriteData) &&
++          !rex::HasFlags(access, filesystem::Access::kAppendData)) continue;
++      if (rex::HasFlags(file->file->GetInfo().attributes, filesystem::FileAttributes::kDirectory))
++        continue;
++      auto flushed = file->file->Flush();
++      if (!flushed && result == kernel::X_ERROR_SUCCESS) result = kernel::ToXResult(flushed);
++    }
++  }
+   if (overlapped_ptr) {
+     CurrentTitle().overlapped_dispatcher.Complete(overlapped_ptr.GetGuestAddress(),
+                                                   {.result = result});
+diff --git a/src/xam/xam_file.cpp b/src/xam/xam_file.cpp
+index 8eafa4a..ef22ceb 100644
+--- a/src/xam/xam_file.cpp
++++ b/src/xam/xam_file.cpp
+@@ -15,6 +15,7 @@
+ #include <span>
+ 
+ #include <rex/filesystem/file_stat.h>
++#include <rex/filesystem/file.h>
+ #include <rex/filesystem/file_open.h>
+ #include <rex/filesystem/file_system.h>
+ #include <rex/logging/log_category.h>
+@@ -220,8 +221,10 @@ REX_XAM_SHIM_FN(SetEndOfFile, u32, u32 hFile) {
+ }
+ 
+ REX_XAM_SHIM_FN(FlushFileBuffers, u32, u32 hFile) {
+-  (void)hFile;
+-  return 1;
++  auto file = CurrentTitle().objects.Get<kernel::FileObject>(hFile);
++  if (!file) return 0;
++  std::lock_guard lock(file->file_lock);
++  return file->file->Flush() ? 1u : 0u;
+ }
+ 
+ REX_XAM_SHIM_FN(DeleteFileA, u32, MappedString lpFileName) {
+diff --git a/tests/unit/kernel/files_test.cpp b/tests/unit/kernel/files_test.cpp
+index a2c9d75..e4595f4 100644
+--- a/tests/unit/kernel/files_test.cpp
++++ b/tests/unit/kernel/files_test.cpp
+@@ -1266,3 +1266,23 @@ REX_TEST_CASE("files: GetFileAttributesExA on a missing file sets the last error
+     CHECK(CallingThread(c).GetLastError() == NtToDos(rex::kernel::X_STATUS_OBJECT_NAME_NOT_FOUND));
+   });
+ }
++
++REX_TEST_CASE("files: campaign content flush preserves writable data and reports invalid roots",
++              "[kernel][files][campaign_flush]") {
++  KernelFixture fixture([](const std::filesystem::path& root) { WriteScratch(root, "save.dat", 16); });
++  MountScratch(fixture);
++  fixture.RunOnGuestThread([](Caller& c) {
++    const u32 handle_ptr = c.Alloc(4);
++    const u32 status_block = c.Alloc(8);
++    REQUIRE(c.Kernel("NtCreateFile",
++                     {handle_ptr, kReadWriteAccess, c.AllocAttributes("scratch:\\save.dat"),
++                      status_block, 0, 0, 3, 1, 0x20}) == 0);
++    const u32 handle = c.Load32(handle_ptr);
++    CHECK(c.XAM("XamContentFlush", {c.AllocString("scratch"), 0}) == 0);
++    CHECK(c.XAM("FlushFileBuffers", {handle}) == 1);
++    CHECK(c.Kernel("NtClose", {handle}) == 0);
++    CHECK(c.XAM("FlushFileBuffers", {handle}) == 0);
++    CHECK(c.XAM("XamContentFlush", {c.AllocString("missing_campaign"), 0}) != 0);
++  });
++  CHECK(std::filesystem::file_size(fixture.GetRoot() / "scratch" / "save.dat") == 16);
++}
+\ No newline at end of file
