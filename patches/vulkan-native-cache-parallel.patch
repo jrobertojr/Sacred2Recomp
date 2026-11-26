@@ -1,0 +1,188 @@
+diff --git a/src/gpu/xenos/vulkan/pipeline_cache.cpp b/src/gpu/xenos/vulkan/pipeline_cache.cpp
+index d476c48..f9b681b 100644
+--- a/src/gpu/xenos/vulkan/pipeline_cache.cpp
++++ b/src/gpu/xenos/vulkan/pipeline_cache.cpp
+@@ -17,6 +17,7 @@
+ #include <xxhash.h>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
+@@ -27,6 +28,8 @@
+ #include <vector>
+ 
+ #include <format>
++#include <fstream>
++#include "gpu/xenos/host/vulkan/vulkan_instance.h"
+ 
+ #include <rex/assert.h>
+ #include <rex/platform/perf.h>
+@@ -187,6 +190,95 @@ bool VulkanPipelineCache::Initialize() {
+   return true;
+ }
+ 
++void VulkanPipelineCache::InitializeNativePipelineCache(
++    const std::filesystem::path& cache_root, u32 title_id) {
++  std::unique_lock<std::shared_mutex> lock(native_pipeline_cache_mutex_);
++  if (native_pipeline_cache_ != VK_NULL_HANDLE) return;
++  const auto* vd = command_processor_.GetVulkanDevice();
++  const auto& ifn = vd->GetVulkanInstance()->GetFunctions();
++  const auto device = vd->GetDevice();
++  const auto create = reinterpret_cast<PFN_vkCreatePipelineCache>(
++      ifn.vkGetDeviceProcAddr(device, "vkCreatePipelineCache"));
++  native_cache_get_data_ = reinterpret_cast<PFN_vkGetPipelineCacheData>(
++      ifn.vkGetDeviceProcAddr(device, "vkGetPipelineCacheData"));
++  native_cache_destroy_ = reinterpret_cast<PFN_vkDestroyPipelineCache>(
++      ifn.vkGetDeviceProcAddr(device, "vkDestroyPipelineCache"));
++  if (!create || !native_cache_get_data_ || !native_cache_destroy_) return;
++  VkPhysicalDeviceProperties properties{};
++  ifn.vkGetPhysicalDeviceProperties(vd->GetPhysicalDevice(), &properties);
++  constexpr size_t max_bytes = 64 * 1024 * 1024;
++  std::error_code ec;
++  const auto directory = cache_root / "vulkan-native";
++  std::filesystem::create_directories(directory, ec);
++  if (ec) return;
++  native_cache_path_ = directory / std::format("{:08X}-{:08X}-{:08X}-{:08X}.bin",
++      title_id, properties.vendorID, properties.deviceID, properties.driverVersion);
++  std::vector<char> bytes;
++  const auto size = std::filesystem::file_size(native_cache_path_, ec);
++  if (!ec && size >= sizeof(VkPipelineCacheHeaderVersionOne) && size <= max_bytes) {
++    bytes.resize(static_cast<size_t>(size));
++    std::ifstream file(native_cache_path_, std::ios::binary);
++    if (!file.read(bytes.data(), static_cast<std::streamsize>(bytes.size()))) bytes.clear();
++    if (!bytes.empty()) {
++      VkPipelineCacheHeaderVersionOne header{};
++      std::memcpy(&header, bytes.data(), sizeof(header));
++      if (header.headerSize < sizeof(header) || header.headerSize > bytes.size() ||
++          header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
++          header.vendorID != properties.vendorID || header.deviceID != properties.deviceID ||
++          std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID, VK_UUID_SIZE))
++        bytes.clear();
++    }
++  }
++  VkPipelineCacheCreateInfo info{};
++  info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++  info.initialDataSize = bytes.size();
++  info.pInitialData = bytes.empty() ? nullptr : bytes.data();
++  auto result = create(device, &info, nullptr, &native_pipeline_cache_);
++  if (result != VK_SUCCESS && !bytes.empty()) {
++    bytes.clear();
++    info.initialDataSize = 0;
++    info.pInitialData = nullptr;
++    native_pipeline_cache_ = VK_NULL_HANDLE;
++    result = create(device, &info, nullptr, &native_pipeline_cache_);
++  }
++  if (result != VK_SUCCESS) native_pipeline_cache_ = VK_NULL_HANDLE;
++  REXGPU_INFO("S2NATIVE_CACHE init result={} loaded_bytes={}",
++              static_cast<i32>(result), bytes.size());
++}
++
++void VulkanPipelineCache::ShutdownNativePipelineCache() {
++  std::unique_lock<std::shared_mutex> lock(native_pipeline_cache_mutex_);
++  if (native_pipeline_cache_ == VK_NULL_HANDLE) return;
++  const auto device = command_processor_.GetVulkanDevice()->GetDevice();
++  try {
++    size_t size = 0;
++    if (native_cache_get_data_(device, native_pipeline_cache_, &size, nullptr) == VK_SUCCESS &&
++        size && size <= 64 * 1024 * 1024) {
++      std::vector<char> bytes(size);
++      if (native_cache_get_data_(device, native_pipeline_cache_, &size, bytes.data()) == VK_SUCCESS) {
++        auto temporary = native_cache_path_;
++        temporary += std::format(".{:016X}.tmp", reinterpret_cast<uintptr_t>(this));
++        {
++          std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
++          file.write(bytes.data(), static_cast<std::streamsize>(size));
++          file.close();
++          if (file) {
++            std::error_code ec;
++            std::filesystem::rename(temporary, native_cache_path_, ec);
++            if (!ec) REXGPU_INFO("S2NATIVE_CACHE saved_bytes={}", size);
++            else REXGPU_WARN("S2NATIVE_CACHE rename failed: {}", ec.message());
++          }
++        }
++        std::error_code ec;
++        std::filesystem::remove(temporary, ec);
++      }
++    }
++  } catch (...) {
++    REXGPU_WARN("S2NATIVE_CACHE save failed; continuing shutdown");
++  }
++  native_cache_destroy_(device, native_pipeline_cache_, nullptr);
++  native_pipeline_cache_ = VK_NULL_HANDLE;
++}
+ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                   u32 title_id, bool blocking) {
+   ShutdownShaderStorage();
+@@ -195,6 +287,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+     startup_loading_ = false;
+   }
+ 
++  InitializeNativePipelineCache(cache_root, title_id);
+   auto shader_storage_root = cache_root / "shaders";
+   auto shader_storage_shareable_root = shader_storage_root / "shareable";
+   if (!std::filesystem::exists(shader_storage_shareable_root)) {
+@@ -574,6 +667,7 @@ void VulkanPipelineCache::Shutdown() {
+   }
+   creation_completion_event_.reset();
+ 
++  ShutdownNativePipelineCache();
+   ShutdownShaderStorage();
+ 
+   const gpu::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+@@ -3078,9 +3172,25 @@ bool VulkanPipelineCache::CreatePipeline(const PipelineCreationArguments& creati
+ 
+   const gpu::vulkan::VulkanDevice::Functions& dfn = vulkan_device->GetFunctions();
+   const VkDevice device = vulkan_device->GetDevice();
+-  VkPipeline pipeline;
+-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+-                                                         &pipeline_create_info, nullptr, &pipeline);
++  VkPipeline pipeline = VK_NULL_HANDLE;
++  const auto s2_compile_begin = std::chrono::steady_clock::now();
++  VkResult create_result;
++  {
++    // Default Vulkan pipeline caches are internally synchronized.
++    // Shared ownership prevents destruction during parallel creation.
++    std::shared_lock<std::shared_mutex> lock(native_pipeline_cache_mutex_);
++    create_result = dfn.vkCreateGraphicsPipelines(device, native_pipeline_cache_, 1,
++                                                  &pipeline_create_info, nullptr, &pipeline);
++  }
++  const auto s2_compile_us = std::chrono::duration_cast<std::chrono::microseconds>(
++      std::chrono::steady_clock::now() - s2_compile_begin).count();
++  if (s2_compile_us >= 8000 || create_result != VK_SUCCESS) {
++    REXGPU_INFO("S2PIPELINE compile_us={} placeholder={} result={} vs={:016X} ps={:016X}",
++                s2_compile_us, creating_placeholder, static_cast<i32>(create_result),
++                creation_arguments.vertex_shader->GetShader().GetUcodeDataHash(),
++                creation_arguments.pixel_shader
++                    ? creation_arguments.pixel_shader->GetShader().GetUcodeDataHash() : 0);
++  }
+   if (create_result != VK_SUCCESS) {
+     u64 ps_hash = creation_arguments.pixel_shader
+                       ? creation_arguments.pixel_shader->GetShader().GetUcodeDataHash()
+diff --git a/src/gpu/xenos/vulkan/pipeline_cache.h b/src/gpu/xenos/vulkan/pipeline_cache.h
+index c052436..dd79e19 100644
+--- a/src/gpu/xenos/vulkan/pipeline_cache.h
++++ b/src/gpu/xenos/vulkan/pipeline_cache.h
+@@ -26,6 +26,7 @@
+ #include <functional>
+ #include <memory>
+ #include <mutex>
++#include <shared_mutex>
+ #include <queue>
+ #include <set>
+ #include <thread>
+@@ -415,6 +416,13 @@ class VulkanPipelineCache {
+ 
+   void StorageWriteThread();
+   gpu::ShaderStorage<Shader, PipelineStoredDescription> storage_;
++  void InitializeNativePipelineCache(const std::filesystem::path& cache_root, u32 title_id);
++  void ShutdownNativePipelineCache();
++  std::shared_mutex native_pipeline_cache_mutex_;
++  VkPipelineCache native_pipeline_cache_ = VK_NULL_HANDLE;
++  PFN_vkGetPipelineCacheData native_cache_get_data_ = nullptr;
++  PFN_vkDestroyPipelineCache native_cache_destroy_ = nullptr;
++  std::filesystem::path native_cache_path_;
+ 
+   mutable std::mutex creation_request_lock_;
+   std::condition_variable creation_request_cond_;
