@@ -1,0 +1,15 @@
+/generated/
+/out/
+/build/
+/extracted/
+/input/
+*.iso
+*.xex
+*.7z
+*.zip
+*.exe
+*.dll
+*.pdb
+*.log
+.env
+*.sav
