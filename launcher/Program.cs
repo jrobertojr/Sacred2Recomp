@@ -31,7 +31,7 @@ sealed class Launcher : Form {
   folder.Click+=(_,_)=>{using var d=new FolderBrowserDialog();if(d.ShowDialog()==DialogResult.OK)SelectSource(d.SelectedPath);};
   install.Click+=async (_,_)=>await Install();
   cancel.Click+=(_,_)=>cts?.Cancel();
-  play.Click+=(_,_)=>{try{if(exe==null||game==null)return;var p=new ProcessStartInfo(exe){WorkingDirectory=Path.GetDirectoryName(exe)!,UseShellExecute=false};p.ArgumentList.Add("--title.game_root="+game);p.ArgumentList.Add("--gpu.driver=vulkan");p.ArgumentList.Add("--gpu.vulkan.render_target_path=fsi");Process.Start(p);}catch(Exception e){MessageBox.Show(e.Message);}};
+  play.Click+=(_,_)=>{try{if(exe==null||game==null)return;var p=new ProcessStartInfo(exe){WorkingDirectory=Path.GetDirectoryName(exe)!,UseShellExecute=false};p.ArgumentList.Add("--title.game_root="+game);p.ArgumentList.Add("--gpu.driver=vulkan");p.ArgumentList.Add("--gpu.vulkan.render_target_path=fsi");var cache=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"Sacred2Recomp","cache");Directory.CreateDirectory(cache);p.ArgumentList.Add("--app.cache_root="+cache);p.ArgumentList.Add("--log.level=info");Process.Start(p);}catch(Exception e){MessageBox.Show(e.Message);}};
   FormClosing+=(_,e)=>{if(cts!=null){e.Cancel=true;cts.Cancel();}};
  }
  void SelectSource(string path){source.Text=path;play.Enabled=false;progress.Value=0;}
